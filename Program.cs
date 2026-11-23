@@ -1,49 +1,78 @@
-using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Token comes from configuration / environment variable (Auth__Token). A development default is used only if none is set.
+// The token comes from configuration / environment variable (Auth__Token).
+// The development fallback is allowed ONLY in the Development environment; otherwise startup fails.
 var apiToken = builder.Configuration["Auth:Token"];
 if (string.IsNullOrWhiteSpace(apiToken))
 {
+    if (!builder.Environment.IsDevelopment())
+        throw new InvalidOperationException("Auth:Token must be configured outside Development (set the Auth__Token environment variable).");
+
     apiToken = "dev-token-123";
-    Console.WriteLine("WARNING: Auth:Token is not set. Using the development token. Set Auth__Token for real use.");
+    Console.WriteLine("WARNING: Auth:Token is not set. Using the development token (Development environment only).");
 }
 
+// Reject oversized request bodies before they are read into memory.
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 64 * 1024);
+
 builder.Services.AddSingleton<IUserRepository, InMemoryUserRepository>();
+
+// Rate limiting: a fixed window per application (limit can be changed with RateLimit__PermitPerMinute).
+var permitPerMinute = builder.Configuration.GetValue("RateLimit:PermitPerMinute", 100);
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = (ctx, _) => new ValueTask(
+        Problems.Write(ctx.HttpContext, StatusCodes.Status429TooManyRequests, "Too Many Requests", "Rate limit exceeded. Try again later."));
+    options.AddFixedWindowLimiter("api", o =>
+    {
+        o.Window = TimeSpan.FromMinutes(1);
+        o.PermitLimit = permitPerMinute;
+        o.QueueLimit = 0;
+    });
+});
 
 var app = builder.Build();
 
 // ---- Middleware pipeline (order matters) --------------------------------------------------
+// HTTPS is enforced outside Development (the Bearer token must never travel unencrypted).
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHsts();
+    app.UseHttpsRedirection();
+}
 // 1. Error handling first, so it catches exceptions from everything after it.
-// 2. Logging next, so even rejected (401) requests are logged.
-// 3. Authentication last, right before the endpoints.
+// 2. Logging next, so even rejected requests (401, 429) are logged.
+// 3. Rate limiting, then authentication, right before the endpoints.
 app.UseMiddleware<ErrorHandlingMiddleware>();
 app.UseMiddleware<RequestLoggingMiddleware>();
+app.UseRateLimiter();
 app.UseMiddleware<TokenAuthenticationMiddleware>(apiToken);
 
 // ---- Endpoints ------------------------------------------------------------------------------
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
-var users = app.MapGroup("/users");
+var users = app.MapGroup("/users").RequireRateLimiting("api");
 
-// GET /users?page=1&pageSize=20 - list with paging (limits memory use and response size)
+// GET /users?page=1&pageSize=20 - the repository returns only the requested page
 users.MapGet("/", (IUserRepository repo, int? page, int? pageSize) =>
 {
     var p = Math.Max(page ?? 1, 1);
     var size = Math.Clamp(pageSize ?? 20, 1, 100);
-    var all = repo.GetAll();
-    var items = all.Skip((p - 1) * size).Take(size).ToList();
-    return Results.Ok(new { page = p, pageSize = size, total = all.Count, items });
+    var (items, total) = repo.GetPage(p, size);
+    return Results.Ok(new { page = p, pageSize = size, total, items });
 });
 
 // GET /users/{id}
 users.MapGet("/{id:int}", (int id, IUserRepository repo) =>
-    repo.Get(id) is { } user ? Results.Ok(user) : Results.NotFound(Error($"User {id} was not found.")));
+    repo.Get(id) is { } user ? Results.Ok(user) : Problems.NotFound($"User {id} was not found."));
 
 // POST /users
 users.MapPost("/", (UserRequest? request, IUserRepository repo) =>
@@ -51,11 +80,10 @@ users.MapPost("/", (UserRequest? request, IUserRepository repo) =>
     var errors = Validate(request);
     if (errors is not null) return Results.ValidationProblem(errors);
 
-    if (repo.EmailExists(request!.Email))
-        return Results.Conflict(Error("A user with this email already exists."));
-
-    var created = repo.Add(request);
-    return Results.Created($"/users/{created.Id}", created);
+    // Check-and-insert is one atomic operation inside the repository (no race between two requests).
+    return repo.TryAdd(request!, out var created)
+        ? Results.Created($"/users/{created!.Id}", created)
+        : Problems.Conflict("A user with this email already exists.");
 });
 
 // PUT /users/{id}
@@ -64,23 +92,21 @@ users.MapPut("/{id:int}", (int id, UserRequest? request, IUserRepository repo) =
     var errors = Validate(request);
     if (errors is not null) return Results.ValidationProblem(errors);
 
-    if (repo.Get(id) is null)
-        return Results.NotFound(Error($"User {id} was not found."));
-    if (repo.EmailExists(request!.Email, ignoreUserId: id))
-        return Results.Conflict(Error("Another user already uses this email."));
-
-    return Results.Ok(repo.Update(id, request));
+    return repo.TryUpdate(id, request!, out var updated) switch
+    {
+        UpdateResult.Updated => Results.Ok(updated),
+        UpdateResult.EmailTaken => Problems.Conflict("Another user already uses this email."),
+        _ => Problems.NotFound($"User {id} was not found.")
+    };
 });
 
 // DELETE /users/{id}
 users.MapDelete("/{id:int}", (int id, IUserRepository repo) =>
-    repo.Delete(id) ? Results.NoContent() : Results.NotFound(Error($"User {id} was not found.")));
+    repo.Delete(id) ? Results.NoContent() : Problems.NotFound($"User {id} was not found."));
 
 app.Run();
 
 // ---- Helpers --------------------------------------------------------------------------------
-static object Error(string message) => new { error = message };
-
 // Validates a request with its DataAnnotations. Returns null when valid.
 static Dictionary<string, string[]>? Validate(UserRequest? request)
 {
@@ -97,11 +123,21 @@ static Dictionary<string, string[]>? Validate(UserRequest? request)
         .ToDictionary(g => g.Key, g => g.Select(x => x.Message).ToArray());
 }
 
+// One error format (RFC 7807 ProblemDetails) for every error response.
+public static class Problems
+{
+    public static IResult NotFound(string detail) => Results.Problem(detail: detail, statusCode: StatusCodes.Status404NotFound, title: "Not Found");
+    public static IResult Conflict(string detail) => Results.Problem(detail: detail, statusCode: StatusCodes.Status409Conflict, title: "Conflict");
+    public static Task Write(HttpContext context, int status, string title, string detail) =>
+        Results.Problem(detail: detail, statusCode: status, title: title).ExecuteAsync(context);
+}
+
 // ---- Models ---------------------------------------------------------------------------------
 public record User(int Id, string FirstName, string LastName, string Email, string Department);
 
 public class UserRequest
 {
+    // [Required] already rejects empty and whitespace-only strings.
     [Required(ErrorMessage = "First name is required.")]
     [StringLength(50, MinimumLength = 2, ErrorMessage = "First name must be 2-50 characters.")]
     public string FirstName { get; set; } = "";
@@ -121,54 +157,93 @@ public class UserRequest
 }
 
 // ---- Data access (thread-safe, in-memory) ----------------------------------------------------
+public enum UpdateResult { Updated, NotFound, EmailTaken }
+
 public interface IUserRepository
 {
-    IReadOnlyList<User> GetAll();
+    (IReadOnlyList<User> Items, int Total) GetPage(int page, int pageSize);
     User? Get(int id);
-    bool EmailExists(string email, int? ignoreUserId = null);
-    User Add(UserRequest request);
-    User Update(int id, UserRequest request);
+    bool TryAdd(UserRequest request, out User? created);
+    UpdateResult TryUpdate(int id, UserRequest request, out User? updated);
     bool Delete(int id);
 }
 
 public class InMemoryUserRepository : IUserRepository
 {
-    private readonly ConcurrentDictionary<int, User> _users = new();
+    // One lock protects the users, the email index and the id counter, so every
+    // check-and-change (email uniqueness, update of an existing user) is atomic.
+    private readonly object _lock = new();
+    private readonly SortedDictionary<int, User> _users = new();
+    private readonly Dictionary<string, int> _emailIndex = new(StringComparer.OrdinalIgnoreCase);   // O(1) email lookup
     private int _nextId;
 
     public InMemoryUserRepository()
     {
-        Add(new UserRequest { FirstName = "Alice", LastName = "Johnson", Email = "alice@techhive.example", Department = "HR" });
-        Add(new UserRequest { FirstName = "Bob", LastName = "Smith", Email = "bob@techhive.example", Department = "IT" });
+        TryAdd(new UserRequest { FirstName = "Alice", LastName = "Johnson", Email = "alice@techhive.example", Department = "HR" }, out _);
+        TryAdd(new UserRequest { FirstName = "Bob", LastName = "Smith", Email = "bob@techhive.example", Department = "IT" }, out _);
     }
 
-    public IReadOnlyList<User> GetAll() => _users.Values.OrderBy(u => u.Id).ToList();
-
-    public User? Get(int id) => _users.TryGetValue(id, out var user) ? user : null;
-
-    public bool EmailExists(string email, int? ignoreUserId = null) =>
-        _users.Values.Any(u => u.Id != ignoreUserId && string.Equals(u.Email, email.Trim(), StringComparison.OrdinalIgnoreCase));
-
-    public User Add(UserRequest r)
+    public (IReadOnlyList<User> Items, int Total) GetPage(int page, int pageSize)
     {
-        var id = Interlocked.Increment(ref _nextId);            // thread-safe unique ids
-        var user = new User(id, r.FirstName.Trim(), r.LastName.Trim(), r.Email.Trim(), r.Department.Trim());
-        _users[id] = user;
-        return user;
+        // long arithmetic: a huge page number must not overflow int and wrap around to a negative skip.
+        var skip = (int)Math.Min((long)(page - 1) * pageSize, int.MaxValue);
+        lock (_lock)
+            return (_users.Values.Skip(skip).Take(pageSize).ToList(), _users.Count);   // only one page is copied
     }
 
-    public User Update(int id, UserRequest r)
+    public User? Get(int id)
     {
-        var user = new User(id, r.FirstName.Trim(), r.LastName.Trim(), r.Email.Trim(), r.Department.Trim());
-        _users[id] = user;
-        return user;
+        lock (_lock) return _users.TryGetValue(id, out var user) ? user : null;
     }
 
-    public bool Delete(int id) => _users.TryRemove(id, out _);
+    public bool TryAdd(UserRequest request, out User? created)
+    {
+        var (first, last, email, department) = Normalize(request);
+        lock (_lock)
+        {
+            if (_emailIndex.ContainsKey(email)) { created = null; return false; }
+            var id = ++_nextId;
+            created = new User(id, first, last, email, department);
+            _users[id] = created;
+            _emailIndex[email] = id;
+            return true;
+        }
+    }
+
+    public UpdateResult TryUpdate(int id, UserRequest request, out User? updated)
+    {
+        var (first, last, email, department) = Normalize(request);
+        lock (_lock)
+        {
+            updated = null;
+            if (!_users.TryGetValue(id, out var existing)) return UpdateResult.NotFound;   // deleted in the meantime: never recreated
+            if (_emailIndex.TryGetValue(email, out var owner) && owner != id) return UpdateResult.EmailTaken;
+
+            _emailIndex.Remove(existing.Email);
+            _emailIndex[email] = id;
+            updated = new User(id, first, last, email, department);
+            _users[id] = updated;
+            return UpdateResult.Updated;
+        }
+    }
+
+    public bool Delete(int id)
+    {
+        lock (_lock)
+        {
+            if (!_users.Remove(id, out var removed)) return false;
+            _emailIndex.Remove(removed.Email);
+            return true;
+        }
+    }
+
+    // Trim once, in one place.
+    private static (string First, string Last, string Email, string Department) Normalize(UserRequest r) =>
+        (r.FirstName.Trim(), r.LastName.Trim(), r.Email.Trim(), r.Department.Trim());
 }
 
 // ---- Middleware -------------------------------------------------------------------------------
-// Catches unhandled exceptions and returns a consistent JSON error instead of a stack trace.
+// Catches unhandled exceptions and returns a consistent ProblemDetails error instead of a stack trace.
 public class ErrorHandlingMiddleware(RequestDelegate next, ILogger<ErrorHandlingMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
@@ -177,27 +252,42 @@ public class ErrorHandlingMiddleware(RequestDelegate next, ILogger<ErrorHandling
         {
             await next(context);
         }
+        catch (BadHttpRequestException ex)
+        {
+            // Malformed JSON, oversized body, etc.: a client error (400/413), not a server error.
+            if (context.Response.HasStarted) throw;
+            context.Response.Clear();
+            await Problems.Write(context, ex.StatusCode, ex.StatusCode == StatusCodes.Status413PayloadTooLarge ? "Payload Too Large" : "Bad Request",
+                ex.StatusCode == StatusCodes.Status413PayloadTooLarge ? "The request body is too large." : "The request could not be read. Check that the JSON is valid.");
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Unhandled exception for {Method} {Path}", context.Request.Method, context.Request.Path);
             if (context.Response.HasStarted) throw;
             context.Response.Clear();
-            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-            await context.Response.WriteAsJsonAsync(new { error = "Internal server error." });
+            await Problems.Write(context, StatusCodes.Status500InternalServerError, "Internal Server Error", "An unexpected error occurred.");
         }
     }
 }
 
-// Logs method, path, status code and duration of every request.
+// Logs method, path, status code and duration of every request, even when a later component throws.
 public class RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
     {
         var timer = Stopwatch.StartNew();
-        await next(context);
-        timer.Stop();
-        logger.LogInformation("{Method} {Path} -> {StatusCode} in {Elapsed} ms",
-            context.Request.Method, context.Request.Path, context.Response.StatusCode, timer.ElapsedMilliseconds);
+        var status = StatusCodes.Status500InternalServerError;   // used if next() throws
+        try
+        {
+            await next(context);
+            status = context.Response.StatusCode;
+        }
+        finally
+        {
+            timer.Stop();
+            logger.LogInformation("{Method} {Path} -> {StatusCode} in {Elapsed} ms",
+                context.Request.Method, context.Request.Path, status, timer.ElapsedMilliseconds);
+        }
     }
 }
 
@@ -227,8 +317,7 @@ public class TokenAuthenticationMiddleware(RequestDelegate next, string expected
             }
         }
 
-        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         context.Response.Headers.WWWAuthenticate = "Bearer";
-        await context.Response.WriteAsJsonAsync(new { error = "Unauthorized. A valid Bearer token is required." });
+        await Problems.Write(context, StatusCodes.Status401Unauthorized, "Unauthorized", "A valid Bearer token is required.");
     }
 }
