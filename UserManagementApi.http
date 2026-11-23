@@ -1,0 +1,56 @@
+@host = http://localhost:5000
+@token = dev-token-123
+
+### Health check (no token needed)
+GET {{host}}/health
+
+### List users (paged)
+GET {{host}}/users?page=1&pageSize=20
+Authorization: Bearer {{token}}
+
+### Get one user
+GET {{host}}/users/1
+Authorization: Bearer {{token}}
+
+### Create a user
+POST {{host}}/users
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "firstName": "Carol",
+  "lastName": "Lee",
+  "email": "carol@techhive.example",
+  "department": "Finance"
+}
+
+### Create with invalid data (expect 400)
+POST {{host}}/users
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "firstName": "C",
+  "lastName": "",
+  "email": "not-an-email",
+  "department": ""
+}
+
+### Update a user
+PUT {{host}}/users/3
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "firstName": "Carol",
+  "lastName": "Lee-Park",
+  "email": "carol@techhive.example",
+  "department": "Legal"
+}
+
+### Delete a user
+DELETE {{host}}/users/3
+Authorization: Bearer {{token}}
+
+### Missing token (expect 401)
+GET {{host}}/users
