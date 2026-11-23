@@ -1,6 +1,6 @@
 # User Management API
 
-A small ASP.NET Core Minimal API (.NET 10) for managing users. It has full CRUD endpoints, input validation, and three middleware components (error handling, request logging and token authentication). Data is kept in memory, so no database is needed.
+A small ASP.NET Core Minimal API (.NET 10) for managing users. It has full CRUD endpoints, input validation, and four middleware components (error handling, request logging, rate limiting and token authentication). Data is kept in memory, so no database is needed.
 
 ## Run it
 
@@ -8,20 +8,21 @@ A small ASP.NET Core Minimal API (.NET 10) for managing users. It has full CRUD 
 dotnet run
 ```
 
-The API listens on the URL printed in the console. The default development token is `dev-token-123`. To use your own token:
+This uses the included launch profile (Development environment, http://localhost:5000) and the development token `dev-token-123`. Outside Development the app refuses to start unless a token is configured:
 
 ```bash
 # Windows PowerShell
-$env:Auth__Token = "my-secret-token"; dotnet run
+$env:Auth__Token = "my-secret-token"; $env:ASPNETCORE_ENVIRONMENT = "Production"; dotnet run
 
 # macOS / Linux
-Auth__Token=my-secret-token dotnet run
+Auth__Token=my-secret-token ASPNETCORE_ENVIRONMENT=Production dotnet run
 ```
 
-Try the requests in `UserManagementApi.http` (VS Code REST Client or Visual Studio) or use curl:
+Try the requests in `UserManagementApi.http` (VS Code REST Client or Visual Studio) or use PowerShell:
 
-```bash
-curl -H "Authorization: Bearer dev-token-123" http://localhost:5000/users
+```powershell
+$h = @{ Authorization = "Bearer dev-token-123" }
+Invoke-RestMethod -Uri http://localhost:5000/users -Headers $h
 ```
 
 ## Endpoints
@@ -29,41 +30,54 @@ curl -H "Authorization: Bearer dev-token-123" http://localhost:5000/users
 | Method | Route | Description | Success | Errors |
 |---|---|---|---|---|
 | GET | `/health` | Health check (no token needed) | 200 | |
-| GET | `/users?page=&pageSize=` | List users with paging (pageSize 1-100) | 200 | 401 |
-| GET | `/users/{id}` | Get one user | 200 | 401, 404 |
-| POST | `/users` | Create a user | 201 | 400, 401, 409 |
-| PUT | `/users/{id}` | Update a user | 200 | 400, 401, 404, 409 |
-| DELETE | `/users/{id}` | Delete a user | 204 | 401, 404 |
+| GET | `/users?page=&pageSize=` | List users with paging (pageSize 1-100) | 200 | 401, 429 |
+| GET | `/users/{id}` | Get one user | 200 | 401, 404, 429 |
+| POST | `/users` | Create a user | 201 | 400, 401, 409, 413, 429 |
+| PUT | `/users/{id}` | Update a user | 200 | 400, 401, 404, 409, 413, 429 |
+| DELETE | `/users/{id}` | Delete a user | 204 | 401, 404, 429 |
 
-A user has `id`, `firstName`, `lastName`, `email` and `department`.
+A user has `id`, `firstName`, `lastName`, `email` and `department`. All errors use the standard ProblemDetails JSON format.
 
 ## Validation
 
-Requests to create or update a user are validated with DataAnnotations: first name, last name and department are required (2-50 characters), and email is required, must be a valid address and at most 254 characters. An empty or null body returns 400. Duplicate emails (case-insensitive) return 409. Invalid data returns a clear 400 message per field instead of being stored.
+Requests to create or update a user are validated with DataAnnotations: first name, last name and department are required (2-50 characters, whitespace-only values are rejected), and email is required, must be a valid address and at most 254 characters. An empty body, a null body or malformed JSON returns 400, a body above 64 KB returns 413, and a duplicate email (case-insensitive) returns 409.
 
 ## Middleware
 
-The order matters: `ErrorHandling -> RequestLogging -> TokenAuthentication -> endpoints`.
+The order matters: `ErrorHandling -> RequestLogging -> RateLimiting -> TokenAuthentication -> endpoints`.
 
-1. **ErrorHandlingMiddleware** catches any unhandled exception, logs it, and returns a consistent JSON `500` response without a stack trace.
-2. **RequestLoggingMiddleware** logs the method, path, status code and duration of every request, including rejected ones.
-3. **TokenAuthenticationMiddleware** requires `Authorization: Bearer <token>` on every endpoint except `/health`. The token is compared in constant time and invalid or missing tokens get `401`.
+1. **ErrorHandlingMiddleware** turns unhandled exceptions into a generic 500 response (details only in the log) and bad requests (malformed JSON, oversized body) into 400/413.
+2. **RequestLoggingMiddleware** logs the method, path, status code and duration of every request, including rejected ones and requests that end with an error.
+3. **Rate limiting** (built-in ASP.NET Core) allows 100 requests per minute on `/users` and answers 429 after that (`RateLimit__PermitPerMinute` changes the limit).
+4. **TokenAuthenticationMiddleware** requires `Authorization: Bearer <token>` on every endpoint except `/health`. The token is compared in constant time, and a missing or wrong token gets 401.
 
-## Debugging with an AI assistant
+Outside Development, HTTPS redirection and HSTS are enabled so the token is never sent over plain HTTP.
 
-The code was reviewed with an AI coding assistant for bugs that are common in user APIs. These problems were checked and are handled, and each fix was tested before it was kept.
+## Debugging and review with Microsoft Copilot
 
-| Problem checked | Fix |
-|---|---|
-| Creating a user with a missing or null body could crash the endpoint (NullReferenceException) | Body is checked first and a 400 validation message is returned |
-| Invalid data such as an empty name or a bad email was stored | DataAnnotations validation returns 400 with a message for each field |
-| Two users could register the same email | Case-insensitive duplicate check returns 409 (also on update, ignoring the user's own record) |
-| Unknown ids returned 200 with empty data or threw an exception | GET, PUT and DELETE return 404 with a clear message |
-| Ids could repeat when requests arrived at the same time | Thread-safe ConcurrentDictionary and Interlocked.Increment for ids |
-| Unhandled errors exposed a stack trace | Error handling middleware returns a generic 500 and logs the details |
-| Listing returned every user at once | Paging with limits on page size |
-| Token comparison with == can leak timing information | Constant-time comparison with CryptographicOperations.FixedTimeEquals |
+The first version of `Program.cs` was reviewed with Microsoft Copilot using this prompt: "Review this ASP.NET Core Minimal API for bugs, missing validation, security problems and performance issues. List each problem and show the fix." Copilot returned 14 findings plus two validation notes, rated by severity. I checked each one, applied the ones that were correct, tested them again, and left out a few with a reason.
+
+| Copilot finding | Decision | What changed |
+|---|---|---|
+| High: the development token is used silently if `Auth:Token` is missing | Applied | Startup fails outside Development; a launch profile keeps `dotnet run` working locally |
+| High: race condition, two requests can add the same email | Applied | Check and insert happen atomically under one lock (test: 60 parallel requests with the same email gave one 201 and 59 409) |
+| Medium: email check scans every user (O(n)) | Applied | A dictionary index gives O(1) lookups |
+| Medium: PUT can recreate a user that was deleted in between | Applied | Existence check and update happen under the same lock (tested with parallel PUT and DELETE) |
+| Medium: no rate limiting | Applied | Built-in fixed-window rate limiter, 429 when exceeded |
+| Medium: no HTTPS enforcement | Applied | HSTS and HTTPS redirection outside Development |
+| Low: no request size limit | Applied | 64 KB limit returns 413 |
+| Low: logging is skipped if a later component throws | Applied | `try/finally` in the logging middleware |
+| Low: the whole list is copied before paging | Applied | The repository returns only the requested page |
+| Low: repeated `Trim()` calls | Applied | Values are normalized once in one method |
+| Low: several different error formats | Applied | One ProblemDetails format for all errors |
+| High: use the built-in authentication handler instead of custom middleware | Not applied | The assignment asks for middleware, so the custom authentication middleware stays; a built-in JWT or handler is the next step for production |
+| Medium: pass `CancellationToken` to endpoints | Not applied | All work is in memory and synchronous, so cancellation would have no effect |
+| Low: `/health` is public | Not applied | A public liveness check is intended; it returns no data |
+| Validation note: whitespace-only names pass `[Required]` | Not applied | Tested: `[Required]` already rejects whitespace-only strings (400) |
+| Validation note: store emails in lower case | Not applied | Emails keep their original casing, and all comparisons are case-insensitive |
+
+While testing the changes I found two more problems myself: malformed JSON returned 500 in the Development environment (fixed in the error handling middleware to return 400), and a very large page number could overflow an integer in the paging calculation (fixed with `long` arithmetic).
 
 ## Tests performed
 
-All endpoints and the middleware were exercised with real HTTP requests: valid and invalid create, update and delete requests, unknown ids, duplicate emails, a malformed JSON body, an empty body, paging, and requests with a missing or wrong token. Results matched the table above, and the request log shows one line per request.
+All endpoints and middleware were exercised with real HTTP requests: valid and invalid create, update and delete requests, unknown ids, duplicate emails, malformed JSON, an empty body, an oversized body, paging (including a huge page number), rate limiting, missing or wrong tokens, starting in Production without a token (fails) and with a token (starts), and parallel requests for the race conditions.
